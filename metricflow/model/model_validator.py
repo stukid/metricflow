@@ -1,6 +1,7 @@
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import copy
 import logging
+import multiprocessing
 from typing import List, Sequence
 
 from metricflow.model.objects.user_configured_model import UserConfiguredModel
@@ -85,15 +86,29 @@ class ModelValidator:
 
         results: List[ModelValidationResults] = []
 
-        with ProcessPoolExecutor(max_workers=self._max_workers) as executor:
-            futures = [
-                executor.submit(validation_rule.validate_model_serialized_for_multiprocessing, serialized_model)
+        if self._max_workers == 1:
+            # A single-worker process pool provides no parallelism and can be
+            # unsafe after threaded runtimes such as LanceDB have initialized.
+            # Keep the serialized validation boundary, but execute the rules in
+            # the current process.
+            serialized_results = [
+                validation_rule.validate_model_serialized_for_multiprocessing(serialized_model)
                 for validation_rule in self._rules
             ]
-            for future in as_completed(futures):
-                res = future.result()
-                result = ModelValidationResults.parse_raw(res)
-                results.append(result)
+        else:
+            # Do not inherit the application's global multiprocessing policy.
+            # ``spawn`` starts validators with a clean runtime on macOS, Linux,
+            # and Windows instead of forking live threads and async runtimes.
+            context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=self._max_workers, mp_context=context) as executor:
+                futures = [
+                    executor.submit(validation_rule.validate_model_serialized_for_multiprocessing, serialized_model)
+                    for validation_rule in self._rules
+                ]
+                serialized_results = [future.result() for future in as_completed(futures)]
+
+        for serialized_result in serialized_results:
+            results.append(ModelValidationResults.parse_raw(serialized_result))
 
         return ModelBuildResult(model=model, issues=ModelValidationResults.merge(results))
 
