@@ -363,9 +363,9 @@ class ModelValidationRule(ABC):
     def validate_model_serialized_for_multiprocessing(cls, serialized_model: str) -> str:
         """Validate a model serialized via Pydantic's .model_dump_json() method, and return a list of JSON serialized issues
 
-        This method exists because our validations are forked into parallel processes via
-        multiprocessing.ProcessPoolExecutor, and passing a model or validation results object can result in
-        idiosyncratic behavior and inscrutable errors due to interactions between pickling and pydantic objects.
+        This serialization boundary supports both in-process validation and optional parallel
+        validation via ProcessPoolExecutor. Passing Pydantic objects directly across a process
+        boundary can produce idiosyncratic pickling behavior and inscrutable errors.
         """
         return ModelValidationResults.from_issues_sequence(
             cls.validate_model(UserConfiguredModel.model_validate_json(serialized_model))

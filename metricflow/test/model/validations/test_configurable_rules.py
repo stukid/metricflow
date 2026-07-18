@@ -60,8 +60,9 @@ def test_model_validator_releases_process_pool(
     class RecordingExecutor:
         instances: list["RecordingExecutor"] = []
 
-        def __init__(self, max_workers: int) -> None:
+        def __init__(self, max_workers: int, mp_context: Any) -> None:
             self.max_workers = max_workers
+            self.mp_context = mp_context
             self.entered = False
             self.exited = False
             RecordingExecutor.instances.append(self)
@@ -85,5 +86,28 @@ def test_model_validator_releases_process_pool(
     assert len(RecordingExecutor.instances) == 1
     executor = RecordingExecutor.instances[0]
     assert executor.max_workers == 7
+    assert executor.mp_context.get_start_method() == "spawn"
     assert executor.entered is True
     assert executor.exited is True
+
+
+def test_model_validator_runs_single_worker_in_current_process(
+    simple_model__with_primary_transforms: UserConfiguredModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_process_pool(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("single-worker validation should not create a process pool")
+
+    monkeypatch.setattr(model_validator_module, "ProcessPoolExecutor", unexpected_process_pool)
+
+    result = ModelValidator(rules=[NonEmptyRule()], max_workers=1).validate_model(simple_model__with_primary_transforms)
+
+    assert result.issues.all_issues == ()
+
+
+def test_model_validator_runs_parallel_rules_with_spawn(
+    simple_model__with_primary_transforms: UserConfiguredModel,
+) -> None:
+    result = ModelValidator(rules=[NonEmptyRule()], max_workers=2).validate_model(simple_model__with_primary_transforms)
+
+    assert result.issues.all_issues == ()
