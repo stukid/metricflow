@@ -2,10 +2,11 @@ import logging
 import textwrap
 import time
 from functools import cached_property
-from typing import ClassVar, Optional, Sequence
+from typing import Any, ClassVar, Optional, Sequence
 
 import pandas as pd
 import sqlalchemy
+from pandas.api import types as pandas_types
 
 from metricflow.dataflow.sql_table import SqlTable
 from metricflow.protocols.sql_client import SqlEngine, SqlEngineAttributes, SqlIsolationLevel
@@ -119,21 +120,21 @@ class DorisSqlClient(StarRocksSqlClient):
 
         column_definitions = []
         for col_name, dtype in df.dtypes.items():
-            if dtype == "object":
+            if pandas_types.is_bool_dtype(dtype):
+                sql_type = "BOOLEAN"
+            elif pandas_types.is_integer_dtype(dtype):
+                sql_type = "BIGINT"
+            elif pandas_types.is_float_dtype(dtype):
+                sql_type = "DOUBLE"
+            elif pandas_types.is_datetime64_any_dtype(dtype):
+                sql_type = "DATETIME"
+            elif pandas_types.is_object_dtype(dtype):
                 # Doris does not allow TEXT/STRING as an automatically selected
                 # key column, while VARCHAR is supported.
                 sql_type = "VARCHAR(65533)"
-            elif dtype == "int64":
-                sql_type = "BIGINT"
-            elif dtype == "float64":
-                sql_type = "DOUBLE"
-            elif dtype == "bool":
-                sql_type = "BOOLEAN"
-            elif "datetime" in str(dtype):
-                sql_type = "DATETIME"
             else:
                 sql_type = "VARCHAR(65533)"
-            escaped_col_name = col_name.replace("`", "``")
+            escaped_col_name = str(col_name).replace("`", "``")
             column_definitions.append(f"`{escaped_col_name}` {sql_type}")
 
         create_table_parts = [f"CREATE TABLE {sql_table.sql} ({', '.join(column_definitions)})"]
@@ -147,27 +148,33 @@ class DorisSqlClient(StarRocksSqlClient):
         elif chunk_size <= 0:
             raise ValueError("chunk_size must be a positive integer")
 
-        for start_idx in range(0, len(df), chunk_size):
-            chunk_df = df.iloc[start_idx : start_idx + chunk_size]
-            values_list = []
-            for _, row in chunk_df.iterrows():
-                values = []
-                for value in row:
-                    if pd.isna(value):
-                        values.append("NULL")
-                    elif isinstance(value, str):
-                        escaped_value = value.replace("'", "''")
-                        values.append(f"'{escaped_value}'")
-                    elif isinstance(value, bool):
-                        values.append("1" if value else "0")
-                    elif isinstance(value, (int, float)):
-                        values.append(str(value))
-                    else:
-                        escaped_value = str(value).replace("'", "''")
-                        values.append(f"'{escaped_value}'")
-                values_list.append(f"({', '.join(values)})")
+        escaped_columns = [f"`{str(column).replace('`', '``')}`" for column in df.columns]
+        parameter_names = [f"value_{index}" for index in range(len(df.columns))]
+        placeholders = [f":{name}" for name in parameter_names]
+        insert_statement = sqlalchemy.text(
+            f"INSERT INTO {sql_table.sql} ({', '.join(escaped_columns)}) VALUES ({', '.join(placeholders)})"
+        )
 
-            if values_list:
-                self.execute(f"INSERT INTO {sql_table.sql} VALUES {', '.join(values_list)}")
+        with self._engine_connection(self._engine) as connection:
+            for start_idx in range(0, len(df), chunk_size):
+                chunk_df = df.iloc[start_idx : start_idx + chunk_size]
+                parameter_rows = [
+                    {name: self._normalize_bind_value(value) for name, value in zip(parameter_names, row, strict=True)}
+                    for row in chunk_df.itertuples(index=False, name=None)
+                ]
+                if parameter_rows:
+                    connection.execute(insert_statement, parameter_rows)
+            connection.commit()
 
         logger.info(f"Created table '{sql_table.sql}' from a DataFrame in {time.time() - start_time:.2f}s")
+
+    @staticmethod
+    def _normalize_bind_value(value: Any) -> Any:
+        """Convert pandas and NumPy scalar values into DB-API compatible bind values."""
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.to_pydatetime()
+
+        item = getattr(value, "item", None)
+        return item() if callable(item) else value

@@ -129,22 +129,53 @@ class TestDorisClient:
         assert 'PROPERTIES ("replication_num" = "1")' in statement
         assert statement.endswith("AS\n  SELECT 1 AS value")
 
-    def test_dataframe_table_uses_doris_key_compatible_string_type(self) -> None:
+    def test_dataframe_table_uses_doris_types_and_parameterized_inserts(self) -> None:
         client = self._client()
+        connection = MagicMock()
         with (
             patch.object(client, "query", return_value=pd.DataFrame({"Alive": ["true"]})),
             patch.object(client, "execute") as execute,
+            patch.object(client, "_engine_connection") as engine_connection,
         ):
+            engine_connection.return_value.__enter__.return_value = connection
             client.create_table_from_dataframe(
                 SqlTable(schema_name="test", table_name="sample"),
-                pd.DataFrame({"name": ["O'Reilly"], "score": [1]}),
+                pd.DataFrame(
+                    {
+                        "name": ["O'Reilly\\", None],
+                        "int32_value": pd.Series([1, 2], dtype="int32"),
+                        "nullable_int": pd.Series([3, pd.NA], dtype="Int64"),
+                        "float32_value": pd.Series([1.5, 2.5], dtype="float32"),
+                        "nullable_float": pd.Series([3.5, pd.NA], dtype="Float64"),
+                        "nullable_bool": pd.Series([True, pd.NA], dtype="boolean"),
+                        "event_time": pd.to_datetime(["2026-07-21", None]),
+                    }
+                ),
             )
 
-        create_statement = execute.call_args_list[0].args[0]
-        insert_statement = execute.call_args_list[1].args[0]
+        create_statement = execute.call_args.args[0]
         assert "`name` VARCHAR(65533)" in create_statement
+        assert "`int32_value` BIGINT" in create_statement
+        assert "`nullable_int` BIGINT" in create_statement
+        assert "`float32_value` DOUBLE" in create_statement
+        assert "`nullable_float` DOUBLE" in create_statement
+        assert "`nullable_bool` BOOLEAN" in create_statement
+        assert "`event_time` DATETIME" in create_statement
         assert 'PROPERTIES ("replication_num" = "1")' in create_statement
-        assert "'O''Reilly'" in insert_statement
+
+        insert_statement, parameter_rows = connection.execute.call_args.args
+        assert str(insert_statement).startswith("INSERT INTO test.sample (`name`, `int32_value`")
+        assert "VALUES (:value_0, :value_1, :value_2, :value_3, :value_4, :value_5, :value_6)" in str(insert_statement)
+        assert parameter_rows[0]["value_0"] == "O'Reilly\\"
+        assert parameter_rows[0]["value_1"] == 1
+        assert isinstance(parameter_rows[0]["value_1"], int)
+        assert parameter_rows[0]["value_5"] is True
+        assert parameter_rows[1]["value_0"] is None
+        assert parameter_rows[1]["value_2"] is None
+        assert parameter_rows[1]["value_4"] is None
+        assert parameter_rows[1]["value_5"] is None
+        assert parameter_rows[1]["value_6"] is None
+        connection.commit.assert_called_once_with()
 
 
 class TestDorisRenderer:

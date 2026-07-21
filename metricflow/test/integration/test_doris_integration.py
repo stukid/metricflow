@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from string import Template
 
+import pandas as pd
 import pytest
 import sqlalchemy.exc
 
@@ -125,6 +126,30 @@ class TestDorisDatabaseOperations:
             assert len(result) == 1
             assert set(result.columns) == {"answer", "greeting"}
             assert table.table_name in doris_client.list_tables(DORIS_DATABASE)
+        finally:
+            doris_client.execute(f"DROP TABLE IF EXISTS {table.sql}")
+
+    def test_create_table_from_dataframe_with_bound_values(self, doris_client) -> None:
+        table = SqlTable(schema_name=DORIS_DATABASE, table_name=f"doris_dataframe_test_{random_id()}")
+        dataframe = pd.DataFrame(
+            {
+                "name": ["O'Reilly\\", None],
+                "count_value": pd.Series([1, pd.NA], dtype="Int64"),
+                "enabled": pd.Series([True, pd.NA], dtype="boolean"),
+            }
+        )
+        try:
+            doris_client.create_table_from_dataframe(table, dataframe)
+
+            populated = doris_client.query(f"SELECT name, count_value, enabled FROM {table.sql} WHERE count_value = 1")
+            assert populated.iloc[0]["name"] == "O'Reilly\\"
+            assert populated.iloc[0]["count_value"] == 1
+            assert bool(populated.iloc[0]["enabled"])
+
+            null_row = doris_client.query(
+                f"SELECT name, count_value, enabled FROM {table.sql} WHERE count_value IS NULL"
+            )
+            assert null_row.iloc[0].isna().all()
         finally:
             doris_client.execute(f"DROP TABLE IF EXISTS {table.sql}")
 
